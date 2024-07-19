@@ -12,6 +12,8 @@ mod ffi {
     }
 }
 
+type IResult<T> = Result<T, Box<dyn std::error::Error>>;
+
 #[derive(Debug, PartialEq, Deserialize)]
 struct Description;
 
@@ -121,11 +123,10 @@ fn find_desc_xml<P>(path: P) -> std::io::Result<PathBuf> where P: AsRef<Path> {
 
     let mut desc_file = PathBuf::new();
     for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        let file_name = file_name.to_str().unwrap();
+        let file_name = entry?.file_name();
+        let file_name = file_name.to_string_lossy();
         if file_name.ends_with(".psf.cix.xml") {
-            desc_file = path.join(file_name);
+            desc_file = path.join(file_name.as_ref());
             break;
         }
     }
@@ -133,7 +134,7 @@ fn find_desc_xml<P>(path: P) -> std::io::Result<PathBuf> where P: AsRef<Path> {
     Ok(desc_file)
 }
 
-fn parse_desc_xml<P>(path: P) -> Result<Container, Box<dyn std::error::Error>> where P:AsRef<Path> {
+fn parse_desc_xml<P>(path: P) -> IResult<Container> where P:AsRef<Path> {
     let file = fs::File::open(path.as_ref())?;
     let reader = std::io::BufReader::new(file);
     let container: Container = quick_xml::de::from_reader(reader)?;
@@ -141,20 +142,18 @@ fn parse_desc_xml<P>(path: P) -> Result<Container, Box<dyn std::error::Error>> w
     Ok(container)
 }
 
-fn expand_delta<P>(psf_file: P, container: &Container, output: P) -> Result<(), Box<dyn std::error::Error>> where P: AsRef<Path>
+fn expand_delta<P>(psf_file: P, container: &Container, output: P) -> IResult<()> where P: AsRef<Path>
 {
     let psf_file = psf_file.as_ref()
-    .canonicalize()
-    .expect("psf file not found");
+    .canonicalize()?;
     let output = output.as_ref()
-    .canonicalize()
-    .expect("output directory not found");
+    .canonicalize()?;
 
     // buffer reader
     let file = fs::File::open(psf_file)?;
     let mut reader = std::io::BufReader::new(file);
 
-    container.files.file.iter().for_each(|file| {
+    for file in &container.files.file {
         let name = file.name.as_str();
         let patch_type = &file.delta.source.type_;
         let offset = file.delta.source.offset;
@@ -162,19 +161,15 @@ fn expand_delta<P>(psf_file: P, container: &Container, output: P) -> Result<(), 
 
         let out_file = output.join(name);
         let out_file_dir = out_file.parent()
-        .expect("get parent directory failed");
-        fs::create_dir_all(out_file_dir)
-        .expect("create directory failed");
+        .ok_or("file parent not found")?;
+        fs::create_dir_all(out_file_dir)?;
 
-        reader.seek(std::io::SeekFrom::Start(offset))
-        .expect("seek failed");
+        reader.seek(std::io::SeekFrom::Start(offset))?;
         
         let mut buffer = vec![0; length];
-        reader.read_exact(&mut buffer)
-        .expect("read buffer failed");
+        reader.read_exact(&mut buffer)?;
 
-        let mut out_file = fs::File::create(out_file)
-        .expect("create file failed");
+        let mut out_file = fs::File::create(out_file)?;
 
         match patch_type {
             SourceType::PA30 => {
@@ -189,23 +184,23 @@ fn expand_delta<P>(psf_file: P, container: &Container, output: P) -> Result<(), 
                 let delta_null_input = DELTA_INPUT::default();
                 let mut delta_output = DELTA_OUTPUT::default();
 
-                unsafe {ApplyDeltaB(0, delta_null_input, delta_input, &mut delta_output) }
-                .expect("apply delta failed");
+                unsafe { 
+                    ApplyDeltaB(0, delta_null_input, delta_input, &mut delta_output)
+                }.expect("apply delta failed");
 
                 let buffer = unsafe { std::slice::from_raw_parts(delta_output.lpStart as *const u8, delta_output.uSize) };
-                out_file.write_all(&buffer)
-                .expect("write file failed");
+                out_file.write_all(&buffer)?;
                 
-                unsafe { DeltaFree(delta_output.lpStart) }
-                .expect("free delta failed");
+                unsafe { 
+                    DeltaFree(delta_output.lpStart)
+                }.expect("free delta failed");
             }
             SourceType::PA19 => {
                 unimplemented!("PA19 not implemented");
             }
 
             SourceType::RAW => {
-                out_file.write_all(&buffer)
-                .expect("write file failed");
+                out_file.write_all(&buffer)?;
             }
         }
         
@@ -217,47 +212,44 @@ fn expand_delta<P>(psf_file: P, container: &Container, output: P) -> Result<(), 
         unsafe { SetFileTime(HANDLE(out_file.as_raw_handle() as _),
             None, 
             None, 
-            Some(&mtimes))}
+            Some(&mtimes)) }
             .expect("set file time failed");
-    });
+    }
 
     Ok(())
 }
 
 
-fn extract_cxx<P>(path: P, output: P) -> Result<(), Box<dyn std::error::Error>> where P:AsRef<Path> {
+fn extract_cxx<P>(path: P, output: P) -> IResult<()> where P:AsRef<Path> {
     let path = path.as_ref().canonicalize()?;
-    let _ = std::fs::create_dir_all(&output)?;
+    let _ = fs::create_dir_all(&output)?;
     let output = output.as_ref().canonicalize()?;
 
     let file_name = path.file_name()
-    .expect("file name not found")
-    .to_str()
-    .expect("file name not found");
+    .ok_or("file name not found")?
+    .to_string_lossy();
     let file_dir = path.parent()
-    .expect("file directory not found")
-    .to_str()
-    .expect("file directory not found");
+    .ok_or("error parent not found")?
+    .to_string_lossy();
     
-    let output = output.to_str()
-    .expect("output directory not found");
+    let output = output.to_string_lossy();
 
-    let succ = ffi::extract(file_name, &file_dir, output);
-    assert!(succ, "extract MSU file failed");
+    let r = ffi::extract(&file_name, &file_dir, &output);
+    assert!(r, "extract failed");
 
     Ok(())
 }
 
 
-pub fn extract_msu<P>(msu_file: P, output: P) -> Result<(), Box<dyn std::error::Error>> where P: AsRef<Path> {
+pub fn extract_msu<P>(msu_file: P, output: P) -> IResult<()> where P: AsRef<Path> {
     extract_cxx(msu_file.as_ref(), output.as_ref())
 }
 
-pub fn extract_cab<P>(cab_file: P, output: P) -> Result<(), Box<dyn std::error::Error>> where P: AsRef<Path> {
+pub fn extract_cab<P>(cab_file: P, output: P) -> IResult<()> where P: AsRef<Path> {
     extract_cxx(cab_file.as_ref(), output.as_ref())
 }
 
-pub fn extract_cab_with_psf<P>(cab_file: P, psf_file: P, output: P) -> Result<(), Box<dyn std::error::Error>> where P: AsRef<Path> {
+pub fn extract_cab_with_psf<P>(cab_file: P, psf_file: P, output: P) -> IResult<()> where P: AsRef<Path> {
     extract_cab(cab_file.as_ref(), output.as_ref())?;
     // find desc file
     let desc_file = find_desc_xml(output.as_ref())?;
@@ -278,7 +270,6 @@ mod tests {
         let output = r"tests\msu_extracted";
         extract_msu(path, output)
         .expect("extract msu failed");
-        
     }
 
     #[test]
@@ -293,7 +284,7 @@ mod tests {
     fn test_extractor_cab_with_psf() {
         let cab_path = r"tests\test.cab";
         let psf_path = r"tests\test.psf";
-        let output = r"downloads\cab_extracted_with_psf";
+        let output = r"tests\cab_extracted_with_psf";
         extract_cab_with_psf(cab_path, psf_path, output)
         .expect("extract cab with psf failed");
     }

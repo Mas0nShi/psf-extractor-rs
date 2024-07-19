@@ -8,8 +8,6 @@
 #include <fcntl.h>
 #include <fdi.h>
 
-#pragma comment(lib, "Cabinet.lib")
-
 #define MAX_PATH_W 32767
 
 // global variables
