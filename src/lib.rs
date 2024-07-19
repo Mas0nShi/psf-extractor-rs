@@ -1,16 +1,9 @@
-use std::{fs, io::{Read, Seek, Write}, os::windows::io::AsRawHandle, path::{Path, PathBuf}};
+use std::{borrow::Borrow, collections::HashSet, fs, io::{ErrorKind, Read, Seek, Write}, os::windows::io::AsRawHandle, path::{Path, PathBuf}};
+use cab::{Cabinet, FileReader};
 use quick_xml;
 use serde::Deserialize;
 use windows::Win32::{Foundation::{FALSE, FILETIME, HANDLE}, Storage::FileSystem::SetFileTime};
 use windows::Win32::System::ApplicationInstallationAndServicing::{ApplyDeltaB, DeltaFree, DELTA_INPUT, DELTA_INPUT_0, DELTA_OUTPUT};
-
-#[cxx::bridge]
-mod ffi {
-    unsafe extern "C++" {
-        include!("psf_extractor/include/extractor.h");
-        fn extract(file_name: &str, file_dir: &str, out_path: &str) -> bool;
-    }
-}
 
 type IResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -219,73 +212,111 @@ fn expand_delta<P>(psf_file: P, container: &Container, output: P) -> IResult<()>
     Ok(())
 }
 
+use std::rc::Rc;
+use std::cell::RefCell;
 
-fn extract_cxx<P>(path: P, output: P) -> IResult<()> where P:AsRef<Path> {
-    let path = path.as_ref().canonicalize()?;
-    let _ = fs::create_dir_all(&output)?;
-    let output = output.as_ref().canonicalize()?;
+struct Extractor<'a> {
+    cab_file_reader: Rc<RefCell<Cabinet<FileReader<'a, fs::File>>>>,
+    psf_file_reader: Rc<RefCell<FileReader<'a, FileReader<'a, fs::File>>>>,
+}
 
-    let file_name = path.file_name()
-    .ok_or("file name not found")?
-    .to_string_lossy();
-    let file_dir = path.parent()
-    .ok_or("error parent not found")?
-    .to_string_lossy();
+impl<'a> Extractor<'a> {
+    pub fn new<P>(src: P) -> IResult<Self>
+ where P:AsRef<Path> {
+        let src_file = fs::File::open(src.as_ref())?;
+        let mut src_r = Cabinet::new(src_file)?;
     
-    let output = output.to_string_lossy();
+        // re to match target cab.
+        let re = regex::Regex::new(r"Windows(\d+\.\d+)-(KB\d+)-(.*)\.cab")?;
+        let cab_name_with_ext = src_r.folder_entries()
+        .flat_map(|folder| folder.file_entries())
+        .find(|file| re.is_match(file.name()))
+        .expect("cab not found")
+        .name()
+        .to_owned();
 
-    let r = ffi::extract(&file_name, &file_dir, &output);
-    assert!(r, "extract failed");
+        let cab_name = Path::new(&cab_name_with_ext).file_stem()
+        .unwrap()
+        .to_string_lossy();
+        
+        println!("cab_name: {}", cab_name);
+        let cab_name_psf = format!("{}.psf", cab_name);
+        
+        let cab_file = src_r.read_file(&cab_name_with_ext)?;
+        let mut cab_r= Cabinet::new(cab_file)?;
 
-    Ok(())
+        // for folder in cab_r.folder_entries() {
+        //     for file in folder.file_entries() {
+        //         println!("cab: {}", file.name());
+        //     }
+        // }
+
+        let xml = cab_r.read_file("express.psf.cix.xml")?;
+        let reader = std::io::BufReader::new(xml);
+        let container: Container = quick_xml::de::from_reader(reader)?;
+        // println!("{:?}", container);
+
+        let psf_file = cab_r.read_file(&cab_name_psf)?;
+
+        Ok(Extractor {
+            cab_file_reader: Rc::new(RefCell::new(cab_r)),
+            psf_file_reader: Rc::new(RefCell::new(psf_file)),
+
+        })
+    }
+
+    pub fn new_s_pack<P>(src: P) -> IResult<Self> where P: AsRef<Path> {
+        let src_file = fs::File::open(src.as_ref())?;
+        let mut src_r = Cabinet::new(src_file)?;
+    
+        // re to match target cab.
+        let re = regex::Regex::new(r"Windows(\d+\.\d+)-(KB\d+)-(.*)\.cab")?;
+        let cab_name_with_ext = src_r.folder_entries()
+        .flat_map(|folder| folder.file_entries())
+        .find(|file| re.is_match(file.name()))
+        .expect("cab not found")
+        .name()
+        .to_owned();
+
+        let cab_name = Path::new(&cab_name_with_ext).file_stem()
+        .unwrap()
+        .to_string_lossy();
+        
+        println!("cab_name: {}", cab_name);
+        
+        let cab_file = src_r.read_file(&cab_name_with_ext)?;
+        let mut cab_r= Cabinet::new(cab_file)?;
+        // depth 1
+        let cab_file = cab_r.read_file(&cab_name_with_ext)?;
+        let mut cab_r = Cabinet::new(cab_file)?;
+
+
+
+        for folder in cab_r.folder_entries() {
+            for file in folder.file_entries() {
+                println!("cab: {}", file.name());
+            }
+        }
+
+        Ok(Extractor{
+            
+        })
+
+    }
 }
 
-
-pub fn extract_msu<P>(msu_file: P, output: P) -> IResult<()> where P: AsRef<Path> {
-    extract_cxx(msu_file.as_ref(), output.as_ref())
-}
-
-pub fn extract_cab<P>(cab_file: P, output: P) -> IResult<()> where P: AsRef<Path> {
-    extract_cxx(cab_file.as_ref(), output.as_ref())
-}
-
-pub fn extract_cab_with_psf<P>(cab_file: P, psf_file: P, output: P) -> IResult<()> where P: AsRef<Path> {
-    extract_cab(cab_file.as_ref(), output.as_ref())?;
-    // find desc file
-    let desc_file = find_desc_xml(output.as_ref())?;
-    let container = parse_desc_xml(desc_file.as_path())?;
-
-    expand_delta(psf_file.as_ref(), &container, output.as_ref())?;
-
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     
     #[test]
-    fn test_extractor_msu() {
-        let path = r"tests\test.msu";
-        let output = r"tests\msu_extracted";
-        extract_msu(path, output)
-        .expect("extract msu failed");
-    }
+    fn test_extract() {
+        // win server 2022
+        let src_path = r"C:\Users\mason\Downloads\windows10.0-kb5022842-x64_708d02971c761091c9d978a18588a315c3817343.msu";
+        // let src_path = r"C:\Users\mason\Downloads\windows11.0-kb5019980-x64_8c5c341ffaa52f1e832bbd2a9acc5072c52b89fe.msu";
+        let r = Extractor::new_s_pack(src_path).unwrap();
 
-    #[test]
-    fn test_extractor_cab() {
-        let path = r"tests\test.cab";
-        let output = r"tests\cab_extracted_only";
-        extract_cab(path, output)
-        .expect("extract cab failed");
-    }
-
-    #[test]
-    fn test_extractor_cab_with_psf() {
-        let cab_path = r"tests\test.cab";
-        let psf_path = r"tests\test.psf";
-        let output = r"tests\cab_extracted_with_psf";
-        extract_cab_with_psf(cab_path, psf_path, output)
-        .expect("extract cab with psf failed");
     }
 }
