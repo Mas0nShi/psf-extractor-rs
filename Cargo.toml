@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 cxx = "*"
-regex = "*"
 quick-xml = {version = "*", features = ["serialize"]}
 serde = { version = "*", features = ["derive"] }
 windows = { version = "*", features = ["Win32_System_ApplicationInstallationAndServicing", "Win32_Storage_FileSystem"] }
